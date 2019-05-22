@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -70,6 +71,10 @@ func (rh *RepositoryHandlers) List(w http.ResponseWriter, r *http.Request) {
 	}
 	_ = unique // TODO remove
 
+	// Start making requests.
+
+	api := rh.CodeHostURL + "/repository"
+
 	// Make the slice which will hold our results. Using a slice with a length of
 	// 0 instead of a nil slice so that 0 results encodes as json [] not null
 	// which is harder for clients to digest.
@@ -78,42 +83,28 @@ func (rh *RepositoryHandlers) List(w http.ResponseWriter, r *http.Request) {
 	// need to keep allocating new backing arrays.
 	repos := make([]Repository, 0, count)
 
-	// Start making requests.
+	ctx := r.Context()
 
-	req, err := http.NewRequest(http.MethodGet, rh.CodeHostURL+"/repository", nil)
-	if err != nil {
-		rh.Log.Println("could not construct url", err)
-		http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
-		return
+	ch := make(chan Repository, count)
+
+	for i := 0; i < count; i++ {
+		go rh.query(ctx, api, i, ch)
 	}
 
-	req = req.WithContext(r.Context())
+loop:
+	for {
+		select {
+		case <-ctx.Done():
+			break loop
 
-	res, err := rh.Client.Do(req)
-	if err != nil {
-		rh.Log.Println("could not call API", err)
-		http.Error(w, http.StatusText(http.StatusBadGateway), http.StatusBadGateway)
-		return
-	}
-	defer res.Body.Close()
+		case repo := <-ch:
+			repos = append(repos, repo)
 
-	if res.StatusCode != http.StatusOK {
-		err := fmt.Errorf("api responded %d", res.StatusCode)
-		rh.Log.Println("could not call API", err)
-		http.Error(w, http.StatusText(http.StatusBadGateway), http.StatusBadGateway)
-		return
+			if len(repos) == count {
+				break loop
+			}
+		}
 	}
-
-	var response struct {
-		Repository Repository `json:"repository"`
-	}
-	if err := json.NewDecoder(res.Body).Decode(&response); err != nil {
-		rh.Log.Println("could not decode API response", err)
-		http.Error(w, http.StatusText(http.StatusBadGateway), http.StatusBadGateway)
-		return
-	}
-
-	repos = append(repos, response.Repository)
 
 	// Package up the response and send it.
 	var result struct {
@@ -131,4 +122,40 @@ func (rh *RepositoryHandlers) List(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("content-type", "application/json; charset=utf-8")
 	w.Write(data)
+}
+
+// TODO add semaphore
+
+func (rh *RepositoryHandlers) query(ctx context.Context, api string, id int, results chan<- Repository) {
+
+	req, err := http.NewRequest(http.MethodGet, api, nil)
+	if err != nil {
+		rh.Log.Println("could not construct url", err)
+		return
+	}
+
+	req = req.WithContext(ctx)
+
+	res, err := rh.Client.Do(req)
+	if err != nil {
+		rh.Log.Println("could not call API", err)
+		return
+	}
+	defer res.Body.Close()
+
+	if res.StatusCode != http.StatusOK {
+		err := fmt.Errorf("api responded %d", res.StatusCode)
+		rh.Log.Println("could not call API", err)
+		return
+	}
+
+	var response struct {
+		Repository Repository `json:"repository"`
+	}
+	if err := json.NewDecoder(res.Body).Decode(&response); err != nil {
+		rh.Log.Println("could not decode API response", err)
+		return
+	}
+
+	results <- response.Repository
 }
