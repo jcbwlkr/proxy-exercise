@@ -83,12 +83,17 @@ func (rh *RepositoryHandlers) List(w http.ResponseWriter, r *http.Request) {
 	// need to keep allocating new backing arrays.
 	repos := make([]Repository, 0, count)
 
+	// seen keeps a map of repository IDs in the results.
+	// TODO: this could be a map[int]struct{} to save on memory but it makes code below uglier. Discuss this.
+	seen := make(map[int]bool)
+
 	ctx := r.Context()
 
 	ch := make(chan Repository, count)
 
-	for i := 0; i < count; i++ {
-		go rh.query(ctx, api, i, ch)
+	var gid int
+	for gid = 0; gid < count; gid++ {
+		go rh.query(ctx, api, gid, ch)
 	}
 
 loop:
@@ -98,6 +103,17 @@ loop:
 			break loop
 
 		case repo := <-ch:
+
+			// If we only want unique results and we've seen this one before then
+			// schedule another goroutine to account for this duplicate.
+			if unique && seen[repo.ID] {
+				go rh.query(ctx, api, gid, ch)
+				gid++
+				break
+			}
+
+			seen[repo.ID] = true
+
 			repos = append(repos, repo)
 
 			if len(repos) == count {
