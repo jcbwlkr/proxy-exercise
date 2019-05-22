@@ -10,6 +10,8 @@ import (
 	"os"
 	"strconv"
 	"time"
+
+	"github.com/pkg/errors"
 )
 
 func main() {
@@ -43,10 +45,11 @@ func app(backend string, logger *log.Logger) http.Handler {
 	return mux
 }
 
+// Repository is the main data record we are proxying from the upstream API.
 type Repository struct {
 	ID        int       `json:"id"`
 	Name      string    `json:"name"`
-	FetchedAt time.Time `json:"fetched_at"`
+	FetchedAt time.Time `json:"fetchedAt"`
 }
 
 // RepositoryHandlers holds handlers related to repositories and their dependencies.
@@ -71,10 +74,6 @@ func (rh *RepositoryHandlers) List(w http.ResponseWriter, r *http.Request) {
 	}
 	_ = unique // TODO remove
 
-	// Start making requests.
-
-	api := rh.CodeHostURL + "/repository"
-
 	// Make the slice which will hold our results. Using a slice with a length of
 	// 0 instead of a nil slice so that 0 results encodes as json [] not null
 	// which is harder for clients to digest.
@@ -91,9 +90,14 @@ func (rh *RepositoryHandlers) List(w http.ResponseWriter, r *http.Request) {
 
 	ch := make(chan Repository, count)
 
+	// sem is used to prevent the proxy from starting more than cap(sem)
+	// concurrent requests upstream.
+	// TODO: decide on the appropriate size for this.
+	sem := make(chan struct{}, 10)
+
 	var gid int
 	for gid = 0; gid < count; gid++ {
-		go rh.query(ctx, api, gid, ch)
+		go rh.query(ctx, gid, sem, ch)
 	}
 
 loop:
@@ -107,7 +111,7 @@ loop:
 			// If we only want unique results and we've seen this one before then
 			// schedule another goroutine to account for this duplicate.
 			if unique && seen[repo.ID] {
-				go rh.query(ctx, api, gid, ch)
+				go rh.query(ctx, gid, sem, ch)
 				gid++
 				break
 			}
@@ -140,38 +144,62 @@ loop:
 	w.Write(data)
 }
 
-// TODO add semaphore
+func (rh *RepositoryHandlers) query(ctx context.Context, id int, sem chan struct{}, results chan<- Repository) {
 
-func (rh *RepositoryHandlers) query(ctx context.Context, api string, id int, results chan<- Repository) {
+	// Driver loop that retries until the context is canceled and respects the semaphore.
+	for {
 
+		// If the context is done then give up.
+		select {
+		case <-ctx.Done():
+			return
+
+		// If we can push a value onto the semaphore then we can start calling.
+		case sem <- struct{}{}:
+			rh.Log.Printf("%d : started", id)
+			repo, err := rh.queryCall(ctx)
+
+			// Take a value out of the semaphore to let another goroutine in.
+			<-sem
+
+			if err != nil {
+				rh.Log.Printf("%d : ERROR %v", id, err)
+				continue
+			}
+
+			// Success!
+			results <- repo
+			rh.Log.Printf("%d : completed", id)
+			return
+		}
+	}
+}
+
+func (rh *RepositoryHandlers) queryCall(ctx context.Context) (Repository, error) {
+	api := rh.CodeHostURL + "/repository"
 	req, err := http.NewRequest(http.MethodGet, api, nil)
 	if err != nil {
-		rh.Log.Println("could not construct url", err)
-		return
+		return Repository{}, errors.Wrap(err, "constructing url")
 	}
 
 	req = req.WithContext(ctx)
 
 	res, err := rh.Client.Do(req)
 	if err != nil {
-		rh.Log.Println("could not call API", err)
-		return
+		return Repository{}, errors.Wrap(err, "calling API")
 	}
 	defer res.Body.Close()
 
 	if res.StatusCode != http.StatusOK {
-		err := fmt.Errorf("api responded %d", res.StatusCode)
-		rh.Log.Println("could not call API", err)
-		return
+		return Repository{}, fmt.Errorf("api responded %d", res.StatusCode)
 	}
 
 	var response struct {
 		Repository Repository `json:"repository"`
 	}
 	if err := json.NewDecoder(res.Body).Decode(&response); err != nil {
-		rh.Log.Println("could not decode API response", err)
-		return
+		return Repository{}, errors.Wrap(err, "decoding response")
 	}
 
-	results <- response.Repository
+	return response.Repository, nil
 }
