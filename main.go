@@ -27,7 +27,14 @@ func main() {
 		Handler: app(*backend, logger),
 	}
 
-	log.Fatal(srv.ListenAndServe())
+	logger.Println("server listening on", srv.Addr)
+	logger.Fatal(srv.ListenAndServe())
+
+	// TODO: Add graceful shutdown
+	// TODO: Add distributed tracing
+	// TODO: Add metrics
+	// TODO: Add debug service with pprof
+	// TODO: Add tests
 }
 
 func app(backend string, logger *log.Logger) http.Handler {
@@ -38,6 +45,7 @@ func app(backend string, logger *log.Logger) http.Handler {
 		CodeHostURL: backend,
 		Client:      &http.Client{},
 		Log:         logger,
+		Cache:       NewCache(),
 	}
 
 	mux.HandleFunc("/repositories", rh.List)
@@ -57,6 +65,7 @@ type RepositoryHandlers struct {
 	CodeHostURL string
 	Client      *http.Client
 	Log         *log.Logger
+	Cache       *Cache
 }
 
 // List calls an upstream server to get a list of repositories.
@@ -68,11 +77,20 @@ func (rh *RepositoryHandlers) List(w http.ResponseWriter, r *http.Request) {
 		count = 1
 	}
 
-	unique := false
-	if r.URL.Query().Get("unique") == "true" {
-		unique = true
+	timeout, err := time.ParseDuration(r.URL.Query().Get("timeout"))
+	if err != nil {
+		// TODO discuss what would be a reasonable default for timeout.
+		timeout = 5 * time.Second
 	}
-	_ = unique // TODO remove
+
+	// seen keeps a map of repository IDs in the results.
+	// if it is nil (the default) then we do not care about duplicates.
+	// if the query parameter "unique" is set to "true" then the map is constructed.
+	// TODO: this could be a map[int]struct{} to save on memory but it makes code below uglier. Discuss this.
+	var seen map[int]bool
+	if r.URL.Query().Get("unique") == "true" {
+		seen = make(map[int]bool)
+	}
 
 	// Make the slice which will hold our results. Using a slice with a length of
 	// 0 instead of a nil slice so that 0 results encodes as json [] not null
@@ -82,11 +100,8 @@ func (rh *RepositoryHandlers) List(w http.ResponseWriter, r *http.Request) {
 	// need to keep allocating new backing arrays.
 	repos := make([]Repository, 0, count)
 
-	// seen keeps a map of repository IDs in the results.
-	// TODO: this could be a map[int]struct{} to save on memory but it makes code below uglier. Discuss this.
-	seen := make(map[int]bool)
-
-	ctx := r.Context()
+	ctx, cancel := context.WithTimeout(r.Context(), timeout)
+	defer cancel()
 
 	ch := make(chan Repository, count)
 
@@ -110,14 +125,16 @@ loop:
 
 			// If we only want unique results and we've seen this one before then
 			// schedule another goroutine to account for this duplicate.
-			if unique && seen[repo.ID] {
-				go rh.query(ctx, gid, sem, ch)
-				gid++
-				break
+			if seen != nil {
+				if seen[repo.ID] {
+					go rh.query(ctx, gid, sem, ch)
+					gid++
+					break
+				}
+				seen[repo.ID] = true
 			}
 
-			seen[repo.ID] = true
-
+			rh.Cache.Add(repo)
 			repos = append(repos, repo)
 
 			if len(repos) == count {
@@ -126,12 +143,34 @@ loop:
 		}
 	}
 
-	// Package up the response and send it.
-	var result struct {
-		Repositories []Repository `json:"repositories"`
+	// If we broke the loop with less than the desired records then we need to
+	// backfill from the cache.
+	for len(repos) < count {
+
+		// If OUR caller went away and we can just abort.
+		select {
+		case <-r.Context().Done():
+			return
+		default:
+		}
+
+		repo, err := rh.Cache.GetRandom(seen)
+		if err != nil {
+			rh.Log.Println(err)
+			break
+		}
+		if seen != nil {
+			seen[repo.ID] = true
+		}
+		repos = append(repos, repo)
 	}
 
-	result.Repositories = repos
+	// Package up the response and send it.
+	result := struct {
+		Repositories []Repository `json:"repositories"`
+	}{
+		Repositories: repos,
+	}
 
 	data, err := json.Marshal(result)
 	if err != nil {
@@ -176,7 +215,7 @@ func (rh *RepositoryHandlers) query(ctx context.Context, id int, sem chan struct
 }
 
 func (rh *RepositoryHandlers) queryCall(ctx context.Context) (Repository, error) {
-	api := rh.CodeHostURL + "/repository"
+	api := rh.CodeHostURL + "/repository?failRatio=0.7"
 	req, err := http.NewRequest(http.MethodGet, api, nil)
 	if err != nil {
 		return Repository{}, errors.Wrap(err, "constructing url")
